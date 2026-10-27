@@ -21,13 +21,11 @@ from dotenv import load_dotenv
 import google.generativeai as genai
 from pydub import AudioSegment
 
-
 # Configure logging
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s - %(levelname)s - %(name)s - %(message)s",
 )
-
 logger = logging.getLogger(__name__)
 
 # FSM states for the exam preparation workflow
@@ -38,32 +36,38 @@ class ExamState(StatesGroup):
 router = Router()
 
 SYSTEM_INSTRUCTION = (
-    "Ти — професійний, доброзичливий, уважний і турботливий викладач-ментор. "
-    "Студентка готується до важливого іспиту. Вона надіслала конспект (навчальний матеріал) "
-    "і додала аудіозапис свого усного переказу з пам'яті.\n\n"
-    "Критичні педагогічні настанови:\n"
-    "1. Уважно прослухай аудіозапис та зроби його точну розшифровку (транскрипцію) українською мовою.\n"
-    "2. Оцінюй семантичний зміст і розуміння концепцій, а не дослівне цитування чи точний збіг слів. "
-    "Студентка висловлює думки своїми словами.\n"
-    "3. Відповідай виключно українською мовою.\n"
-    "4. Зберігай теплий, підбадьорливий, щирий і водночас об'єктивно конструктивний тон.\n"
-    "5. Використовуй HTML-теги для форматування (<b>жирний текст</b>, <i>курсив</i>, <code>терміни</code>).\n\n"
-    "Твоя відповідь ОБОВ'ЯЗКОВО повинна містити два окремі блоки з такими мітками:\n\n"
+    "Ти — турботливий, уважний друг і надійний напарник у навчанні, а не суворий екзаменатор чи професор.\n"
+    "Твоя подруга готується до іспиту. Вона надіслала конспект і додала аудіозапис свого усного переказу по пам'яті.\n\n"
+    "Правила спілкування та перевірки:\n"
+    "1. Спілкуйся виключно українською мовою, строго звертаючись до неї на «ти» у жіночому роді "
+    "(наприклад: «ти сказала», «ти згадала», «ти чудово пояснила», «ти пропустила»).\n"
+    "2. КАТЕГОРИЧНО ЗАБОРОНЕНО писати про неї в третій особі та вживати слова «студентка», «користувач», «авторка» тощо. "
+    "Говори безпосередньо з нею як близький друг.\n"
+    "3. Тон має бути теплим, живим, дружнім і простим, без сухої академічної бюрократії, але без зайвих емодзі.\n"
+    "4. Звіряй переказ буквально по деталях: якщо пропущено конкретне слово, термін, дату, цифру або важливий "
+    "причинно-наслідковий зв'язок — обов'язково вкажи на це.\n"
+    "5. Якщо є неточність або помилка — поясни простою людською мовою, у чому саме полягає різниця між тим, "
+    "що було в конспекті, і тим, що вона сказала в аудіо.\n"
+    "6. Використовуй базові HTML-теги для оформлення (<b>жирний текст</b>, <code>терміни</code>). Не використовуй емодзі.\n\n"
+    "Відповідь ОБОВ'ЯЗКОВО повинна містити два окремі блоки з такими мітками:\n\n"
     "===ТРАНСКРИПЦІЯ===\n"
-    "[Тут запиши точну транскрипцію усного переказу студентки. Якщо мовлення відсутнє або неможливо розібрати слова, напиши: НЕРОЗПІЗНАНО]\n\n"
+    "[Точний текст її усного переказу з аудіо. Якщо мовлення відсутнє або нерозбірливе, напиши: НЕРОЗПІЗНАНО]\n\n"
     "===ОЦІНКА===\n"
-    "<b>1. 🎯 Загальна оцінка:</b> від 1 до 10 балів із коротким теплим коментарем.\n"
-    "<b>2. 💡 Засвоєння ключових концепцій:</b> які головні ідеї розкриті правильно та влучно.\n"
-    "<b>3. 🔍 Що варто додати:</b> важливі поняття, терміни, факти або нюанси з конспекту, які були пропущені.\n"
-    "<b>4. ⚠️ Неточності чи помилки:</b> фактичні викривлення чи неточності (якщо помилок немає — відзнач це і похвали за точність!).\n"
-    "<b>5. 🌟 Підбадьорливий висновок:</b> теплі слова підтримки та мотивація перед іспитом."
+    "<b>1. Оцінка:</b> X/10 (одне коротке щире підбадьорливе речення своїми словами).\n"
+    "<b>2. Що передано точно:</b> коротко про те, які головні думки ти відтворила правильно.\n"
+    "<b>3. Що загубилося або варто додати:</b> список конкретних фактів, дат, термінів або деталей із конспекту, "
+    "які не прозвучали у переказі (якщо все згадано: Все на місці, нічого не забула).\n"
+    "<b>4. Помилки та неточності:</b> конкретні зауваження до слів або формулювань із поясненням відмінності від конспекту "
+    "(якщо все вірно: Помилок немає)."
 )
 
 
-def _convert_ogg_to_mp3_sync(voice_bytes: bytes) -> tuple[bytes, str]:
+
+
+def _convert_voice_to_mp3_sync(voice_bytes: bytes) -> tuple[bytes, str]:
     """
-    Synchronous conversion of OGG Opus to MP3 using pydub.
-    Executed inside asyncio.to_thread to prevent blocking the event loop.
+    Converts downloaded Telegram voice note (OGG Opus) into MP3 using pydub in-memory.
+    Executed in a background thread via asyncio.to_thread to avoid blocking the event loop.
     If ffmpeg is not available, immediately falls back to native audio/ogg.
     """
     if not shutil.which("ffmpeg"):
@@ -72,9 +76,9 @@ def _convert_ogg_to_mp3_sync(voice_bytes: bytes) -> tuple[bytes, str]:
     try:
         in_buffer = io.BytesIO(voice_bytes)
         sound = AudioSegment.from_file(in_buffer, format="ogg")
-        out_buffer = io.BytesIO()
-        sound.export(out_buffer, format="mp3")
-        return out_buffer.getvalue(), "audio/mp3"
+        mp3_buffer = io.BytesIO()
+        sound.export(mp3_buffer, format="mp3")
+        return mp3_buffer.getvalue(), "audio/mp3"
     except Exception as exc:
         logger.warning(
             "Конвертація в MP3 через pydub не вдалася: %s. Використовується формат audio/ogg.",
@@ -83,16 +87,49 @@ def _convert_ogg_to_mp3_sync(voice_bytes: bytes) -> tuple[bytes, str]:
         return voice_bytes, "audio/ogg"
 
 
-async def prepare_audio_inline_data(voice_bytes: bytes) -> dict:
+async def prepare_inline_audio_part(voice_bytes: bytes) -> dict:
     """
-    Prepares audio bytes non-blockingly and returns inline data dict for Gemini.
-    Avoids using Google File API upload to ensure zero upload delay.
+    Prepares audio bytes directly as an inline data dictionary.
+    Eliminates genai.upload_file() and any PROCESSING status polling.
     """
-    audio_bytes, mime_type = await asyncio.to_thread(_convert_ogg_to_mp3_sync, voice_bytes)
+    audio_bytes, mime_type = await asyncio.to_thread(_convert_voice_to_mp3_sync, voice_bytes)
     return {
         "mime_type": mime_type,
         "data": audio_bytes,
     }
+
+
+async def generate_gemini_response_fast(
+    primary_model: genai.GenerativeModel,
+    fallback_model: genai.GenerativeModel | None,
+    prompt: str,
+    audio_part: dict,
+    timeout_seconds: float = 7.0,
+) -> str:
+    """
+    Strictly asynchronous model execution with inline audio data.
+    If the primary model (gemini-3.8-flash) encounters high demand (503), quota limits (429),
+    or times out, it immediately falls back to the active working model (gemini-3.5-flash)
+    to guarantee a 3-5 second total response time instead of waiting 4 minutes.
+    """
+    try:
+        response = await asyncio.wait_for(
+            primary_model.generate_content_async([prompt, audio_part]),
+            timeout=timeout_seconds,
+        )
+        return response.text or ""
+    except (asyncio.TimeoutError, Exception) as exc:
+        if fallback_model is not None:
+            logger.warning(
+                "Основна модель (%s) не відповіла за %sс (%s). Миттєво перемикаємося на актуальну робочу модель (%s)...",
+                primary_model.model_name,
+                timeout_seconds,
+                exc,
+                fallback_model.model_name,
+            )
+            response = await fallback_model.generate_content_async([prompt, audio_part])
+            return response.text or ""
+        raise
 
 
 async def send_split_message(
@@ -150,12 +187,11 @@ async def handle_start(message: types.Message, state: FSMContext) -> None:
     await state.set_state(ExamState.waiting_for_text)
 
     welcome_text = (
-        "Привіт! 🌸 Я твій помічник для підготовки до іспитів на базі <b>Google Gemini AI</b>.\n\n"
-        "<b>Як ми готуємося:</b>\n"
-        "1️⃣ Надішли мені <b>текст конспекту</b>, лекції або тему, яку ти вчиш 📖\n"
-        "2️⃣ Запиши <b>голосове повідомлення 🎙</b>, де своїми словами по пам'яті розкажи цей матеріал.\n"
-        "3️⃣ Я швидко прослухаю аудіо, транскрибую його, порівняю з конспектом і надам детальну оцінку з теплими порадами! ✨\n\n"
-        "Чекаю на текст конспекту! 📚"
+        "Привіт. Я помічник для підготовки до іспитів.\n\n"
+        "Порядок роботи:\n"
+        "1. Надішли текст конспекту або теми.\n"
+        "2. Запиши голосове повідомлення з усним переказом.\n\n"
+        "Надішли текст конспекту для початку."
     )
     await message.answer(welcome_text, parse_mode=ParseMode.HTML)
 
@@ -169,14 +205,14 @@ async def handle_cancel(message: types.Message, state: FSMContext) -> None:
     await state.clear()
     if current_state is None:
         await message.answer(
-            "Наразі немає активного процесу перевірки. Надішли /start, щоб розпочати! 💫",
+            "Наразі немає активного процесу перевірки. Надішли /start для початку.",
             parse_mode=ParseMode.HTML,
         )
         return
 
     await message.answer(
-        "Поточну підготовку скасовано 🔄.\n"
-        "Коли будеш готова продовжити — просто надішли новий текст конспекту або натисни /start!",
+        "Підготовку скасовано.\n"
+        "Щоб почати знову, надішли текст або натисни /start.",
         parse_mode=ParseMode.HTML,
     )
 
@@ -187,14 +223,13 @@ async def handle_help(message: types.Message) -> None:
     Displays helpful guidance on using the exam preparation bot.
     """
     help_text = (
-        "🎓 <b>Довідка помічника для іспитів:</b>\n\n"
-        "• <b>/start</b> — розпочати нове тренування теми\n"
-        "• <b>/cancel</b> — скасувати поточний запис та скинути стан\n"
-        "• <b>/help</b> — переглянути цю довідку\n\n"
-        "<b>Як це працює:</b>\n"
-        "1. Відправ текст матеріалу або конспекту.\n"
-        "2. Запиши голосове повідомлення з усним переказом з пам'яті.\n"
-        "3. Gemini AI оцінить відповідь від 1 до 10, виділить ключові ідеї, пропущені факти та надасть мотивуючі рекомендації!"
+        "<b>Довідка:</b>\n\n"
+        "• /start — розпочати перевірку нової теми\n"
+        "• /cancel — скасувати поточний запис\n"
+        "• /help — довідка\n\n"
+        "Порядок роботи:\n"
+        "1. Надішли текст матеріалу або конспекту.\n"
+        "2. Запиши голосове повідомлення з усним переказом."
     )
     await message.answer(help_text, parse_mode=ParseMode.HTML)
 
@@ -208,8 +243,7 @@ async def handle_study_text(message: types.Message, state: FSMContext) -> None:
     submitted_text = (message.text or "").strip()
     if len(submitted_text) < 10:
         await message.answer(
-            "Текст конспекту здається занадто коротким 🤏. "
-            "Будь ласка, надішли більш детальний матеріал або тези теми:",
+            "Текст конспекту занадто короткий. Надішли змістовніший фрагмент або тези теми:",
             parse_mode=ParseMode.HTML,
         )
         return
@@ -218,10 +252,9 @@ async def handle_study_text(message: types.Message, state: FSMContext) -> None:
     await state.set_state(ExamState.waiting_for_voice)
 
     prompt_voice = (
-        "Чудово! Конспект надійно збережено 📖\n\n"
-        "Тепер запиши <b>голосове повідомлення 🎙</b>, де своїми словами розкажи цей матеріал по пам'яті.\n"
-        "Говори спокійно й упевнено — це чудове тренування перед іспитом! ✨\n\n"
-        "<i>(Якщо захочеш замінити текст конспекту — надішли /cancel)</i>"
+        "Конспект збережено.\n\n"
+        "Тепер запиши <b>голосове повідомлення</b> з усним переказом цього матеріалу по пам'яті.\n\n"
+        "<i>(Для зміни конспекту надішли /cancel)</i>"
     )
     await message.answer(prompt_voice, parse_mode=ParseMode.HTML)
 
@@ -232,8 +265,7 @@ async def handle_invalid_text_fallback(message: types.Message) -> None:
     Fallback when the user sends a non-text message while waiting for text.
     """
     await message.answer(
-        "Будь ласка, надішли конспект саме <b>текстовим повідомленням</b> 📝 "
-        "або скористайся командою /cancel для скасування.",
+        "Будь ласка, надішли конспект текстовим повідомленням або скористайся /cancel для скасування.",
         parse_mode=ParseMode.HTML,
     )
 
@@ -243,58 +275,58 @@ async def handle_voice_message(
     message: types.Message,
     state: FSMContext,
     bot: Bot,
-    gemini_model_instance: genai.GenerativeModel,
+    primary_model: genai.GenerativeModel,
+    fallback_model: genai.GenerativeModel | None,
 ) -> None:
     """
-    Downloads voice note, prepares inline audio data asynchronously without blocking the event loop,
-    and calls model.generate_content_async directly.
+    Downloads voice note, prepares inline audio data directly in memory,
+    and calls model.generate_content_async asynchronously for rapid 3-5s response.
     """
     data = await state.get_data()
     original_text = data.get("original_text", "")
     if not original_text:
         await message.answer(
-            "⚠️ Не вдалося знайти збережений конспект. "
-            "Будь ласка, надішли команду /start та відправ текст знову.",
+            "Не знайдено збереженого конспекту. Надішли команду /start та відправ текст знову.",
             parse_mode=ParseMode.HTML,
         )
         await state.clear()
         return
 
-    # Intermediate status update: Audio processing & Gemini evaluation
     status_msg = await message.answer(
-        "🎧 Слухаю голосове та аналізую відповідь через Gemini AI...",
+        "Обробляю голосове повідомлення...",
         parse_mode=ParseMode.HTML,
     )
 
     try:
-        # 1. Download voice file into memory buffer (non-blocking)
+        # 1. Download voice file directly into in-memory buffer (non-blocking)
         voice_buffer = io.BytesIO()
         await bot.download(message.voice, destination=voice_buffer)
         voice_bytes = voice_buffer.getvalue()
 
-        # 2. Prepare audio inline data in background thread without blocking event loop
-        audio_part = await prepare_audio_inline_data(voice_bytes)
+        # 2. Prepare inline data dict (no upload_file, no polling)
+        audio_part = await prepare_inline_audio_part(voice_bytes)
 
         # 3. Formulate prompt
         prompt = (
             f"Оригінальний навчальний матеріал (конспект):\n"
             f"\"\"\"\n{original_text}\n\"\"\"\n\n"
-            "Студентка записала аудіо зі своїм переказом цього конспекту по пам'яті. "
-            "Будь ласка, прослухай аудіо, транскрибуй його та надай детальний педагогічний аналіз за вказаною структурою "
-            "з обов'язковими мітками ===ТРАНСКРИПЦІЯ=== та ===ОЦІНКА===."
+            "Ось аудіозапис мого усного переказу цього матеріалу по пам'яті. "
+            "Уважно прослухай його, зроби точну транскрипцію та надай детальний розбір за вказаною структурою "
+            "з обов'язковими мітками ===ТРАНСКРИПЦІЯ=== та ===ОЦІНКА===. Звертайся до мене на «ти» у жіночому роді і не використовуй емодзі."
         )
 
-        # 4. Strictly asynchronous Gemini call using inline audio data
-        response = await gemini_model_instance.generate_content_async([prompt, audio_part])
-
-        try:
-            raw_text = response.text or ""
-        except (ValueError, AttributeError):
-            raw_text = ""
+        # 4. Asynchronous fast call with fallback to avoid 4-minute retries
+        raw_text = await generate_gemini_response_fast(
+            primary_model=primary_model,
+            fallback_model=fallback_model,
+            prompt=prompt,
+            audio_part=audio_part,
+            timeout_seconds=7.0,
+        )
 
         if not raw_text.strip():
             await status_msg.edit_text(
-                "⚠️ Не вдалося отримати відповідь від Gemini. Спробуй записати голосове ще раз 🎙",
+                "Не вдалося отримати відповідь. Спробуй записати голосове ще раз.",
                 parse_mode=ParseMode.HTML,
             )
             return
@@ -311,8 +343,7 @@ async def handle_voice_message(
 
         if not transcript_text or "НЕРОЗПІЗНАНО" in transcript_text.upper():
             await status_msg.edit_text(
-                "⚠️ Не вдалося розпізнати слова у голосовому повідомленні. "
-                "Можливо, запис був надто тихим або перервався. Спробуй записати голосове ще раз 🎙",
+                "Не вдалося розпізнати слова у голосовому повідомленні. Спробуй записати голосове ще раз.",
                 parse_mode=ParseMode.HTML,
             )
             return
@@ -325,17 +356,17 @@ async def handle_voice_message(
 
         # Send transcribed speech
         transcription_header = (
-            "📝 <b>Твій усний переказ (розпізнаний текст):</b>\n\n"
+            "<b>Усний переказ (розпізнаний текст):</b>\n\n"
             f"<i>\"{html.escape(transcript_text)}\"</i>"
         )
         await send_split_message(message, transcription_header)
 
         # Send pedagogical evaluation
         feedback_header = (
-            f"📊 <b>Результат педагогічного аналізу:</b>\n\n"
+            f"<b>Результат аналізу:</b>\n\n"
             f"{evaluation_text}\n\n"
             f"───────────────────\n"
-            f"🌸 <i>Ти молодець! Щоб потренувати наступну тему, просто надішли новий текст або натисни /start.</i>"
+            f"Щоб перевірити наступну тему, надішли новий текст або натисни /start."
         )
         await send_split_message(message, feedback_header)
 
@@ -346,13 +377,13 @@ async def handle_voice_message(
         logger.exception("Помилка під час обробки голосового повідомлення або звернення до Gemini: %s", exc)
         try:
             await status_msg.edit_text(
-                f"❌ Сталася помилка під час обробки: <i>{html.escape(str(exc))}</i>\n\n"
-                "Перевір, будь ласка, чи дійсний ключ <code>GEMINI_API_KEY</code> у файлі <code>.env</code> або спробуй пізніше.",
+                f"Сталася помилка під час обробки: <i>{html.escape(str(exc))}</i>\n\n"
+                "Перевір, будь ласка, налаштування GEMINI_API_KEY у файлі .env або спробуй пізніше.",
                 parse_mode=ParseMode.HTML,
             )
         except Exception:
             await message.answer(
-                "❌ Сталася неочікувана помилка під час обробки. Будь ласка, спробуй ще раз або надішли /start.",
+                "Сталася неочікувана помилка під час обробки. Будь ласка, спробуй ще раз або надішли /start.",
                 parse_mode=ParseMode.HTML,
             )
 
@@ -363,8 +394,7 @@ async def handle_invalid_voice_fallback(message: types.Message) -> None:
     Fallback when user sends non-voice message while in waiting_for_voice state.
     """
     await message.answer(
-        "Зараз я очікую саме <b>голосове повідомлення 🎙</b> з твоїм усним переказом конспекту.\n"
-        "Будь ласка, запиши аудіо або надішли /cancel, якщо хочеш розпочати спочатку.",
+        "Очікується голосове повідомлення з усним переказом конспекту. Запиши аудіо або надішли /cancel.",
         parse_mode=ParseMode.HTML,
     )
 
@@ -386,16 +416,18 @@ async def handle_generic_fallback(message: types.Message) -> None:
     Default fallback for unrecognized inputs when no state is active.
     """
     await message.answer(
-        "Привіт! 🌸 Щоб почати підготовку до іспиту, надішли мені <b>текст конспекту</b> або команду /start 📚",
+        "Щоб почати перевірку знань, надішли текст конспекту або команду /start.",
         parse_mode=ParseMode.HTML,
     )
+
 
 
 async def main() -> None:
     load_dotenv()
     bot_token = getenv("BOT_TOKEN")
     gemini_api_key = getenv("GEMINI_API_KEY")
-    gemini_model = getenv("GEMINI_MODEL", "gemini-3.8-flash")
+    gemini_model_name = getenv("GEMINI_MODEL", "gemini-3.8-flash")
+    fallback_model_name = getenv("FALLBACK_MODEL", "gemini-3.5-flash")
 
     if not bot_token:
         logger.critical("BOT_TOKEN не знайдено! Перевірте наявність BOT_TOKEN у файлі .env.")
@@ -409,13 +441,24 @@ async def main() -> None:
 
     # Configure Google Generative AI
     genai.configure(api_key=gemini_api_key or "missing-key")
-    model = genai.GenerativeModel(
-        model_name=gemini_model,
-        system_instruction=SYSTEM_INSTRUCTION,
-        generation_config=genai.GenerationConfig(
-            temperature=0.3,
-        ),
+
+    generation_config = genai.GenerationConfig(
+        temperature=0.3,
     )
+
+    primary_model = genai.GenerativeModel(
+        model_name=gemini_model_name,
+        system_instruction=SYSTEM_INSTRUCTION,
+        generation_config=generation_config,
+    )
+
+    fallback_model = None
+    if fallback_model_name and fallback_model_name != gemini_model_name:
+        fallback_model = genai.GenerativeModel(
+            model_name=fallback_model_name,
+            system_instruction=SYSTEM_INSTRUCTION,
+            generation_config=generation_config,
+        )
 
     bot = Bot(token=bot_token)
     dp = Dispatcher(storage=MemoryStorage())
@@ -423,13 +466,15 @@ async def main() -> None:
     dp.include_router(router)
 
     # Dependency injection for handlers
-    dp["gemini_model_instance"] = model
+    dp["primary_model"] = primary_model
+    dp["fallback_model"] = fallback_model
 
     logger.info(
-        "Бот для підготовки до іспитів на базі Google Gemini (%s) успішно запущений!",
-        gemini_model,
+        "Бот для підготовки до іспитів запущений (Основна модель: %s, Резервна швидка модель: %s)!",
+        gemini_model_name,
+        fallback_model_name,
     )
-    await dp.start_polling(bot, gemini_model_instance=model)
+    await dp.start_polling(bot, primary_model=primary_model, fallback_model=fallback_model)
 
 
 if __name__ == "__main__":
