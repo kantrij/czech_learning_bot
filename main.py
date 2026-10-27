@@ -13,7 +13,8 @@ from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.storage.memory import MemoryStorage
 from dotenv import load_dotenv
-from openai import AsyncOpenAI
+from google import genai
+from google.genai import types as genai_types
 from pydub import AudioSegment
 
 # Configure logging
@@ -31,100 +32,94 @@ class ExamState(StatesGroup):
 router = Router()
 
 
-def prepare_audio_for_stt(voice_bytes: bytes) -> tuple[str, bytes, str]:
+def prepare_audio_for_gemini(voice_bytes: bytes) -> tuple[bytes, str]:
     """
-    Attempts to convert raw voice bytes (Ogg Opus from Telegram) to MP3 using pydub.
-    If ffmpeg is missing or conversion fails, safely falls back to native OGG Opus,
-    which is natively supported by the OpenAI Whisper API.
+    Prepares voice note bytes for Gemini multimodal processing.
+    Attempts to convert to MP3 via pydub if ffmpeg is available.
+    Otherwise falls back directly to raw OGG Opus (audio/ogg),
+    which Google Gemini natively supports.
 
     Returns:
-        tuple of (filename, audio_bytes, content_type)
+        tuple of (audio_bytes, mime_type)
     """
     try:
         in_buffer = io.BytesIO(voice_bytes)
         sound = AudioSegment.from_file(in_buffer, format="ogg")
         out_buffer = io.BytesIO()
         sound.export(out_buffer, format="mp3")
-        return "voice.mp3", out_buffer.getvalue(), "audio/mpeg"
+        return out_buffer.getvalue(), "audio/mp3"
     except Exception as exc:
         logger.warning(
             "Конвертація через pydub не вдалася (можливо, ffmpeg не встановлено): %s. "
-            "Використовується оригінальний формат OGG Opus для Whisper API.",
+            "Використовується нативний формат OGG Opus для Gemini API.",
             exc,
         )
-        return "voice.ogg", voice_bytes, "audio/ogg"
+        return voice_bytes, "audio/ogg"
 
 
-async def transcribe_voice(
-    openai_client: AsyncOpenAI,
-    voice_bytes: bytes,
-    reference_text: str | None = None,
-) -> str:
-    """
-    Transcribes audio using OpenAI Whisper API (whisper-1) in Ukrainian.
-    Biases domain vocabulary by passing the initial snippet of the reference text in prompt.
-    """
-    filename, audio_bytes, content_type = prepare_audio_for_stt(voice_bytes)
-
-    # Bias terminology recognition using up to ~224 tokens (~350 characters)
-    prompt_bias: str | None = None
-    if reference_text:
-        prompt_bias = reference_text[:350].strip()
-
-    transcription = await openai_client.audio.transcriptions.create(
-        model="whisper-1",
-        file=(filename, audio_bytes, content_type),
-        language="uk",
-        prompt=prompt_bias,
-    )
-    return transcription.text.strip()
-
-
-async def evaluate_material(
-    openai_client: AsyncOpenAI,
+async def analyze_exam_material_with_gemini(
+    gemini_client: genai.Client,
+    model_name: str,
     original_text: str,
-    voice_transcript: str,
-) -> str:
+    voice_bytes: bytes,
+) -> tuple[str, str]:
     """
-    Compares the student's verbal explanation against the source study notes
-    using gpt-4o-mini and generates structured, encouraging pedagogical feedback in Ukrainian.
+    Sends the audio voice note and source study notes to Gemini in a single multimodal request.
+    Uses structured delimiters to return (transcript, pedagogical_evaluation).
     """
+    processed_bytes, mime_type = prepare_audio_for_gemini(voice_bytes)
+
     system_instruction = (
-        "Ти — професійний, доброзичливий, турботливий викладач-ментор. "
-        "Твоє завдання — оцінити усний переказ навчального матеріалу студентки з пам'яті, "
-        "порівнявши його з оригінальним конспектом.\n\n"
+        "Ти — професійний, доброзичливий, уважний і турботливий викладач-ментор. "
+        "Студентка готується до важливого іспиту. Вона надіслала конспект (навчальний матеріал) "
+        "і додала аудіозапис свого усного переказу з пам'яті.\n\n"
         "Критичні педагогічні настанови:\n"
-        "1. Оцінюй семантичний зміст і розуміння концепцій, а не дослівне цитування чи точний збіг слів. "
+        "1. Уважно прослухай аудіозапис та зроби його точну розшифровку (транскрипцію) українською мовою.\n"
+        "2. Оцінюй семантичний зміст і розуміння концепцій, а не дослівне цитування чи точний збіг слів. "
         "Студентка висловлює думки своїми словами.\n"
-        "2. Відповідай виключно українською мовою.\n"
-        "3. Зберігай теплий, підбадьорливий, щирий і водночас об'єктивно конструктивний тон.\n"
-        "4. Використовуй HTML-теги для форматування (<b>жирний текст</b>, <i>курсив</i>, <code>терміни</code>).\n\n"
-        "Обов'язково чітко структуруй свою відповідь за такими 5 розділами:\n"
+        "3. Відповідай виключно українською мовою.\n"
+        "4. Зберігай теплий, підбадьорливий, щирий і водночас об'єктивно конструктивний тон.\n"
+        "5. Використовуй HTML-теги для форматування (<b>жирний текст</b>, <i>курсив</i>, <code>терміни</code>).\n\n"
+        "Твоя відповідь ОБОВ'ЯЗКОВО повинна містити два окремі блоки з такими мітками:\n\n"
+        "===ТРАНСКРИПЦІЯ===\n"
+        "[Тут запиши точну транскрипцію усного переказу студентки. Якщо мовлення відсутнє або неможливо розібрати слова, напиши: НЕРОЗПІЗНАНО]\n\n"
+        "===ОЦІНКА===\n"
         "<b>1. 🎯 Загальна оцінка:</b> від 1 до 10 балів із коротким теплим коментарем.\n"
         "<b>2. 💡 Засвоєння ключових концепцій:</b> які головні ідеї розкриті правильно та влучно.\n"
-        "<b>3. 🔍 Що варто додати:</b> важливі поняття, терміни, факти або деталі з конспекту, які були пропущені.\n"
-        "<b>4. ⚠️ Неточності чи помилки:</b> фактичні викривлення чи неточності (якщо помилок немає — відзнач це і щиро похвали за точність!).\n"
+        "<b>3. 🔍 Що варто додати:</b> важливі поняття, терміни, факти або нюанси з конспекту, які були пропущені.\n"
+        "<b>4. ⚠️ Неточності чи помилки:</b> фактичні викривлення чи неточності (якщо помилок немає — відзнач це і похвали за точність!).\n"
         "<b>5. 🌟 Підбадьорливий висновок:</b> теплі слова підтримки та мотивація перед іспитом."
     )
 
     user_prompt = (
         f"<b>Оригінальний навчальний матеріал (конспект):</b>\n"
         f"<blockquote>{html.escape(original_text)}</blockquote>\n\n"
-        f"<b>Транскрипція усного переказу студентки:</b>\n"
-        f"<blockquote>{html.escape(voice_transcript)}</blockquote>\n\n"
-        "Будь ласка, уважно проаналізуй переказ і надай структурований зворотний зв'язок відповідно до інструкцій."
+        "Студентка додала аудіофайл зі своїм переказом матеріалу. "
+        "Будь ласка, прослухай аудіо, транскрибуй його та надай детальний педагогічний аналіз за вказаною структурою."
     )
 
-    response = await openai_client.chat.completions.create(
-        model="gpt-4o-mini",
-        messages=[
-            {"role": "system", "content": system_instruction},
-            {"role": "user", "content": user_prompt},
-        ],
-        temperature=0.3,
+    audio_part = genai_types.Part.from_bytes(data=processed_bytes, mime_type=mime_type)
+
+    response = await gemini_client.aio.models.generate_content(
+        model=model_name,
+        contents=[audio_part, user_prompt],
+        config=genai_types.GenerateContentConfig(
+            system_instruction=system_instruction,
+            temperature=0.3,
+        ),
     )
 
-    return response.choices[0].message.content or ""
+    raw_text = response.text or ""
+
+    if "===ТРАНСКРИПЦІЯ===" in raw_text and "===ОЦІНКА===" in raw_text:
+        after_trans = raw_text.split("===ТРАНСКРИПЦІЯ===")[1]
+        parts = after_trans.split("===ОЦІНКА===")
+        transcript_text = parts[0].strip()
+        evaluation_text = parts[1].strip() if len(parts) > 1 else ""
+        return transcript_text, evaluation_text
+
+    # Graceful fallback if delimiter format was slightly altered by model
+    return "Розпізнано з аудіо", raw_text.strip()
 
 
 async def send_split_message(
@@ -182,11 +177,11 @@ async def handle_start(message: types.Message, state: FSMContext) -> None:
     await state.set_state(ExamState.waiting_for_text)
 
     welcome_text = (
-        "Привіт! 🌸 Я твій помічник для підготовки до іспитів.\n\n"
+        "Привіт! 🌸 Я твій помічник для підготовки до іспитів на базі <b>Google Gemini AI</b>.\n\n"
         "<b>Як ми готуємося:</b>\n"
         "1️⃣ Надішли мені <b>текст конспекту</b>, лекції або тему, яку ти вчиш 📖\n"
         "2️⃣ Запиши <b>голосове повідомлення 🎙</b>, де своїми словами по пам'яті розкажи цей матеріал.\n"
-        "3️⃣ Я уважно послухаю, перевірю твої знання за допомогою штучного інтелекту та надам детальну оцінку з теплими порадами! ✨\n\n"
+        "3️⃣ Я уважно прослухаю аудіо, транскрибую його, порівняю з конспектом і надам детальну оцінку з теплими порадами! ✨\n\n"
         "Чекаю на текст конспекту! 📚"
     )
     await message.answer(welcome_text, parse_mode=ParseMode.HTML)
@@ -226,7 +221,7 @@ async def handle_help(message: types.Message) -> None:
         "<b>Як це працює:</b>\n"
         "1. Відправ текст матеріалу або конспекту.\n"
         "2. Запиши голосове повідомлення з усним переказом з пам'яті.\n"
-        "3. Отримай оцінку від 1 до 10, розбір ключових ідей, пропущених деталей та мотивуючі рекомендації!"
+        "3. Gemini AI оцінить відповідь від 1 до 10, виділить ключові ідеї, пропущені факти та надасть мотивуючі рекомендації!"
     )
     await message.answer(help_text, parse_mode=ParseMode.HTML)
 
@@ -275,12 +270,12 @@ async def handle_voice_message(
     message: types.Message,
     state: FSMContext,
     bot: Bot,
-    openai_client: AsyncOpenAI,
+    gemini_client: genai.Client,
+    gemini_model: str,
 ) -> None:
     """
-    Downloads voice note, transcribes with Whisper (using prompt biasing),
-    evaluates semantic retention against original text with gpt-4o-mini,
-    and returns comprehensive feedback in Ukrainian.
+    Downloads voice note, sends raw audio alongside study notes to Gemini multimodal model,
+    and returns comprehensive pedagogical feedback in Ukrainian.
     """
     data = await state.get_data()
     original_text = data.get("original_text", "")
@@ -293,9 +288,9 @@ async def handle_voice_message(
         await state.clear()
         return
 
-    # Intermediate status update 1: STT
+    # Intermediate status update: Audio processing & Gemini evaluation
     status_msg = await message.answer(
-        "🎧 Слухаю голосове та розпізнаю мову...",
+        "🎧 Слухаю голосове та аналізую відповідь через Gemini AI...",
         parse_mode=ParseMode.HTML,
     )
 
@@ -305,33 +300,21 @@ async def handle_voice_message(
         await bot.download(message.voice, destination=voice_buffer)
         voice_bytes = voice_buffer.getvalue()
 
-        # Step 1: Transcribe via Whisper
-        transcript = await transcribe_voice(
-            openai_client=openai_client,
+        # Multimodal Gemini call
+        transcript, evaluation = await analyze_exam_material_with_gemini(
+            gemini_client=gemini_client,
+            model_name=gemini_model,
+            original_text=original_text,
             voice_bytes=voice_bytes,
-            reference_text=original_text,
         )
 
-        if not transcript or not transcript.strip():
+        if not transcript or "НЕРОЗПІЗНАНО" in transcript.upper():
             await status_msg.edit_text(
                 "⚠️ Не вдалося розпізнати слова у голосовому повідомленні. "
-                "Можливо, запис був надто тихим. Спробуй записати голосове ще раз 🎙",
+                "Можливо, запис був надто тихим або перервався. Спробуй записати голосове ще раз 🎙",
                 parse_mode=ParseMode.HTML,
             )
             return
-
-        # Intermediate status update 2: Evaluation
-        await status_msg.edit_text(
-            "🧠 Аналізую переказ та порівнюю з конспектом...",
-            parse_mode=ParseMode.HTML,
-        )
-
-        # Step 2: Evaluate via LLM (gpt-4o-mini)
-        evaluation = await evaluate_material(
-            openai_client=openai_client,
-            original_text=original_text,
-            voice_transcript=transcript,
-        )
 
         # Cleanup status message
         try:
@@ -359,11 +342,11 @@ async def handle_voice_message(
         await state.clear()
 
     except Exception as exc:
-        logger.exception("Помилка під час обробки голосового повідомлення або звернення до OpenAI: %s", exc)
+        logger.exception("Помилка під час обробки голосового повідомлення або звернення до Gemini: %s", exc)
         try:
             await status_msg.edit_text(
                 f"❌ Сталася помилка під час обробки: <i>{html.escape(str(exc))}</i>\n\n"
-                "Перевір, будь ласка, чи дійсний ключ <code>OPENAI_API_KEY</code> у файлі <code>.env</code> або спробуй пізніше.",
+                "Перевір, будь ласка, чи дійсний ключ <code>GEMINI_API_KEY</code> у файлі <code>.env</code> або спробуй пізніше.",
                 parse_mode=ParseMode.HTML,
             )
         except Exception:
@@ -410,29 +393,34 @@ async def handle_generic_fallback(message: types.Message) -> None:
 async def main() -> None:
     load_dotenv()
     bot_token = getenv("BOT_TOKEN")
-    openai_api_key = getenv("OPENAI_API_KEY")
+    gemini_api_key = getenv("GEMINI_API_KEY")
+    gemini_model = getenv("GEMINI_MODEL", "gemini-2.0-flash")
 
     if not bot_token:
         logger.critical("BOT_TOKEN не знайдено! Перевірте наявність BOT_TOKEN у файлі .env.")
         sys.exit(1)
 
-    if not openai_api_key or openai_api_key == "your_openai_api_key_here":
+    if not gemini_api_key or gemini_api_key == "your_gemini_api_key_here":
         logger.warning(
-            "OPENAI_API_KEY не задано або містить шаблонне значення! "
-            "Переконайтеся, що ви додали дійсний ключ OPENAI_API_KEY у файл .env для роботи Whisper та GPT-4o-mini."
+            "GEMINI_API_KEY не задано або містить шаблонне значення! "
+            "Переконайтеся, що ви додали дійсний ключ GEMINI_API_KEY у файл .env для роботи Gemini AI."
         )
 
     bot = Bot(token=bot_token)
     dp = Dispatcher(storage=MemoryStorage())
-    openai_client = AsyncOpenAI(api_key=openai_api_key or "missing-key")
+    gemini_client = genai.Client(api_key=gemini_api_key or "missing-key")
 
     dp.include_router(router)
 
-    # Make openai_client accessible to handlers via dependency injection
-    dp["openai_client"] = openai_client
+    # Dependency injection for handlers
+    dp["gemini_client"] = gemini_client
+    dp["gemini_model"] = gemini_model
 
-    logger.info("Бот для підготовки до іспитів успішно запущений і готовий до роботи!")
-    await dp.start_polling(bot, openai_client=openai_client)
+    logger.info(
+        "Бот для підготовки до іспитів на базі Google Gemini (%s) успішно запущений!",
+        gemini_model,
+    )
+    await dp.start_polling(bot, gemini_client=gemini_client, gemini_model=gemini_model)
 
 
 if __name__ == "__main__":
