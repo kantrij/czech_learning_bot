@@ -1,8 +1,13 @@
+import warnings
+warnings.filterwarnings("ignore", category=FutureWarning)
+warnings.filterwarnings("ignore", category=RuntimeWarning, module="pydub")
+
 import asyncio
 import html
 import io
 import logging
 from os import getenv
+import shutil
 import sys
 
 from aiogram import Bot, Dispatcher, F, Router, types
@@ -13,15 +18,16 @@ from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.storage.memory import MemoryStorage
 from dotenv import load_dotenv
-from google import genai
-from google.genai import types as genai_types
+import google.generativeai as genai
 from pydub import AudioSegment
+
 
 # Configure logging
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s - %(levelname)s - %(name)s - %(message)s",
 )
+
 logger = logging.getLogger(__name__)
 
 # FSM states for the exam preparation workflow
@@ -31,17 +37,38 @@ class ExamState(StatesGroup):
 
 router = Router()
 
+SYSTEM_INSTRUCTION = (
+    "Ти — професійний, доброзичливий, уважний і турботливий викладач-ментор. "
+    "Студентка готується до важливого іспиту. Вона надіслала конспект (навчальний матеріал) "
+    "і додала аудіозапис свого усного переказу з пам'яті.\n\n"
+    "Критичні педагогічні настанови:\n"
+    "1. Уважно прослухай аудіозапис та зроби його точну розшифровку (транскрипцію) українською мовою.\n"
+    "2. Оцінюй семантичний зміст і розуміння концепцій, а не дослівне цитування чи точний збіг слів. "
+    "Студентка висловлює думки своїми словами.\n"
+    "3. Відповідай виключно українською мовою.\n"
+    "4. Зберігай теплий, підбадьорливий, щирий і водночас об'єктивно конструктивний тон.\n"
+    "5. Використовуй HTML-теги для форматування (<b>жирний текст</b>, <i>курсив</i>, <code>терміни</code>).\n\n"
+    "Твоя відповідь ОБОВ'ЯЗКОВО повинна містити два окремі блоки з такими мітками:\n\n"
+    "===ТРАНСКРИПЦІЯ===\n"
+    "[Тут запиши точну транскрипцію усного переказу студентки. Якщо мовлення відсутнє або неможливо розібрати слова, напиши: НЕРОЗПІЗНАНО]\n\n"
+    "===ОЦІНКА===\n"
+    "<b>1. 🎯 Загальна оцінка:</b> від 1 до 10 балів із коротким теплим коментарем.\n"
+    "<b>2. 💡 Засвоєння ключових концепцій:</b> які головні ідеї розкриті правильно та влучно.\n"
+    "<b>3. 🔍 Що варто додати:</b> важливі поняття, терміни, факти або нюанси з конспекту, які були пропущені.\n"
+    "<b>4. ⚠️ Неточності чи помилки:</b> фактичні викривлення чи неточності (якщо помилок немає — відзнач це і похвали за точність!).\n"
+    "<b>5. 🌟 Підбадьорливий висновок:</b> теплі слова підтримки та мотивація перед іспитом."
+)
 
-def prepare_audio_for_gemini(voice_bytes: bytes) -> tuple[bytes, str]:
-    """
-    Prepares voice note bytes for Gemini multimodal processing.
-    Attempts to convert to MP3 via pydub if ffmpeg is available.
-    Otherwise falls back directly to raw OGG Opus (audio/ogg),
-    which Google Gemini natively supports.
 
-    Returns:
-        tuple of (audio_bytes, mime_type)
+def _convert_ogg_to_mp3_sync(voice_bytes: bytes) -> tuple[bytes, str]:
     """
+    Synchronous conversion of OGG Opus to MP3 using pydub.
+    Executed inside asyncio.to_thread to prevent blocking the event loop.
+    If ffmpeg is not available, immediately falls back to native audio/ogg.
+    """
+    if not shutil.which("ffmpeg"):
+        return voice_bytes, "audio/ogg"
+
     try:
         in_buffer = io.BytesIO(voice_bytes)
         sound = AudioSegment.from_file(in_buffer, format="ogg")
@@ -50,76 +77,22 @@ def prepare_audio_for_gemini(voice_bytes: bytes) -> tuple[bytes, str]:
         return out_buffer.getvalue(), "audio/mp3"
     except Exception as exc:
         logger.warning(
-            "Конвертація через pydub не вдалася (можливо, ffmpeg не встановлено): %s. "
-            "Використовується нативний формат OGG Opus для Gemini API.",
+            "Конвертація в MP3 через pydub не вдалася: %s. Використовується формат audio/ogg.",
             exc,
         )
         return voice_bytes, "audio/ogg"
 
 
-async def analyze_exam_material_with_gemini(
-    gemini_client: genai.Client,
-    model_name: str,
-    original_text: str,
-    voice_bytes: bytes,
-) -> tuple[str, str]:
+async def prepare_audio_inline_data(voice_bytes: bytes) -> dict:
     """
-    Sends the audio voice note and source study notes to Gemini in a single multimodal request.
-    Uses structured delimiters to return (transcript, pedagogical_evaluation).
+    Prepares audio bytes non-blockingly and returns inline data dict for Gemini.
+    Avoids using Google File API upload to ensure zero upload delay.
     """
-    processed_bytes, mime_type = prepare_audio_for_gemini(voice_bytes)
-
-    system_instruction = (
-        "Ти — професійний, доброзичливий, уважний і турботливий викладач-ментор. "
-        "Студентка готується до важливого іспиту. Вона надіслала конспект (навчальний матеріал) "
-        "і додала аудіозапис свого усного переказу з пам'яті.\n\n"
-        "Критичні педагогічні настанови:\n"
-        "1. Уважно прослухай аудіозапис та зроби його точну розшифровку (транскрипцію) українською мовою.\n"
-        "2. Оцінюй семантичний зміст і розуміння концепцій, а не дослівне цитування чи точний збіг слів. "
-        "Студентка висловлює думки своїми словами.\n"
-        "3. Відповідай виключно українською мовою.\n"
-        "4. Зберігай теплий, підбадьорливий, щирий і водночас об'єктивно конструктивний тон.\n"
-        "5. Використовуй HTML-теги для форматування (<b>жирний текст</b>, <i>курсив</i>, <code>терміни</code>).\n\n"
-        "Твоя відповідь ОБОВ'ЯЗКОВО повинна містити два окремі блоки з такими мітками:\n\n"
-        "===ТРАНСКРИПЦІЯ===\n"
-        "[Тут запиши точну транскрипцію усного переказу студентки. Якщо мовлення відсутнє або неможливо розібрати слова, напиши: НЕРОЗПІЗНАНО]\n\n"
-        "===ОЦІНКА===\n"
-        "<b>1. 🎯 Загальна оцінка:</b> від 1 до 10 балів із коротким теплим коментарем.\n"
-        "<b>2. 💡 Засвоєння ключових концепцій:</b> які головні ідеї розкриті правильно та влучно.\n"
-        "<b>3. 🔍 Що варто додати:</b> важливі поняття, терміни, факти або нюанси з конспекту, які були пропущені.\n"
-        "<b>4. ⚠️ Неточності чи помилки:</b> фактичні викривлення чи неточності (якщо помилок немає — відзнач це і похвали за точність!).\n"
-        "<b>5. 🌟 Підбадьорливий висновок:</b> теплі слова підтримки та мотивація перед іспитом."
-    )
-
-    user_prompt = (
-        f"<b>Оригінальний навчальний матеріал (конспект):</b>\n"
-        f"<blockquote>{html.escape(original_text)}</blockquote>\n\n"
-        "Студентка додала аудіофайл зі своїм переказом матеріалу. "
-        "Будь ласка, прослухай аудіо, транскрибуй його та надай детальний педагогічний аналіз за вказаною структурою."
-    )
-
-    audio_part = genai_types.Part.from_bytes(data=processed_bytes, mime_type=mime_type)
-
-    response = await gemini_client.aio.models.generate_content(
-        model=model_name,
-        contents=[audio_part, user_prompt],
-        config=genai_types.GenerateContentConfig(
-            system_instruction=system_instruction,
-            temperature=0.3,
-        ),
-    )
-
-    raw_text = response.text or ""
-
-    if "===ТРАНСКРИПЦІЯ===" in raw_text and "===ОЦІНКА===" in raw_text:
-        after_trans = raw_text.split("===ТРАНСКРИПЦІЯ===")[1]
-        parts = after_trans.split("===ОЦІНКА===")
-        transcript_text = parts[0].strip()
-        evaluation_text = parts[1].strip() if len(parts) > 1 else ""
-        return transcript_text, evaluation_text
-
-    # Graceful fallback if delimiter format was slightly altered by model
-    return "Розпізнано з аудіо", raw_text.strip()
+    audio_bytes, mime_type = await asyncio.to_thread(_convert_ogg_to_mp3_sync, voice_bytes)
+    return {
+        "mime_type": mime_type,
+        "data": audio_bytes,
+    }
 
 
 async def send_split_message(
@@ -181,7 +154,7 @@ async def handle_start(message: types.Message, state: FSMContext) -> None:
         "<b>Як ми готуємося:</b>\n"
         "1️⃣ Надішли мені <b>текст конспекту</b>, лекції або тему, яку ти вчиш 📖\n"
         "2️⃣ Запиши <b>голосове повідомлення 🎙</b>, де своїми словами по пам'яті розкажи цей матеріал.\n"
-        "3️⃣ Я уважно прослухаю аудіо, транскрибую його, порівняю з конспектом і надам детальну оцінку з теплими порадами! ✨\n\n"
+        "3️⃣ Я швидко прослухаю аудіо, транскрибую його, порівняю з конспектом і надам детальну оцінку з теплими порадами! ✨\n\n"
         "Чекаю на текст конспекту! 📚"
     )
     await message.answer(welcome_text, parse_mode=ParseMode.HTML)
@@ -270,12 +243,11 @@ async def handle_voice_message(
     message: types.Message,
     state: FSMContext,
     bot: Bot,
-    gemini_client: genai.Client,
-    gemini_model: str,
+    gemini_model_instance: genai.GenerativeModel,
 ) -> None:
     """
-    Downloads voice note, sends raw audio alongside study notes to Gemini multimodal model,
-    and returns comprehensive pedagogical feedback in Ukrainian.
+    Downloads voice note, prepares inline audio data asynchronously without blocking the event loop,
+    and calls model.generate_content_async directly.
     """
     data = await state.get_data()
     original_text = data.get("original_text", "")
@@ -295,20 +267,49 @@ async def handle_voice_message(
     )
 
     try:
-        # Download voice file into memory buffer
+        # 1. Download voice file into memory buffer (non-blocking)
         voice_buffer = io.BytesIO()
         await bot.download(message.voice, destination=voice_buffer)
         voice_bytes = voice_buffer.getvalue()
 
-        # Multimodal Gemini call
-        transcript, evaluation = await analyze_exam_material_with_gemini(
-            gemini_client=gemini_client,
-            model_name=gemini_model,
-            original_text=original_text,
-            voice_bytes=voice_bytes,
+        # 2. Prepare audio inline data in background thread without blocking event loop
+        audio_part = await prepare_audio_inline_data(voice_bytes)
+
+        # 3. Formulate prompt
+        prompt = (
+            f"Оригінальний навчальний матеріал (конспект):\n"
+            f"\"\"\"\n{original_text}\n\"\"\"\n\n"
+            "Студентка записала аудіо зі своїм переказом цього конспекту по пам'яті. "
+            "Будь ласка, прослухай аудіо, транскрибуй його та надай детальний педагогічний аналіз за вказаною структурою "
+            "з обов'язковими мітками ===ТРАНСКРИПЦІЯ=== та ===ОЦІНКА===."
         )
 
-        if not transcript or "НЕРОЗПІЗНАНО" in transcript.upper():
+        # 4. Strictly asynchronous Gemini call using inline audio data
+        response = await gemini_model_instance.generate_content_async([prompt, audio_part])
+
+        try:
+            raw_text = response.text or ""
+        except (ValueError, AttributeError):
+            raw_text = ""
+
+        if not raw_text.strip():
+            await status_msg.edit_text(
+                "⚠️ Не вдалося отримати відповідь від Gemini. Спробуй записати голосове ще раз 🎙",
+                parse_mode=ParseMode.HTML,
+            )
+            return
+
+        # 5. Parse delimiters
+        if "===ТРАНСКРИПЦІЯ===" in raw_text and "===ОЦІНКА===" in raw_text:
+            after_trans = raw_text.split("===ТРАНСКРИПЦІЯ===")[1]
+            parts = after_trans.split("===ОЦІНКА===")
+            transcript_text = parts[0].strip()
+            evaluation_text = parts[1].strip() if len(parts) > 1 else ""
+        else:
+            transcript_text = "Розпізнано з аудіо"
+            evaluation_text = raw_text.strip()
+
+        if not transcript_text or "НЕРОЗПІЗНАНО" in transcript_text.upper():
             await status_msg.edit_text(
                 "⚠️ Не вдалося розпізнати слова у голосовому повідомленні. "
                 "Можливо, запис був надто тихим або перервався. Спробуй записати голосове ще раз 🎙",
@@ -325,14 +326,14 @@ async def handle_voice_message(
         # Send transcribed speech
         transcription_header = (
             "📝 <b>Твій усний переказ (розпізнаний текст):</b>\n\n"
-            f"<i>\"{html.escape(transcript)}\"</i>"
+            f"<i>\"{html.escape(transcript_text)}\"</i>"
         )
         await send_split_message(message, transcription_header)
 
         # Send pedagogical evaluation
         feedback_header = (
             f"📊 <b>Результат педагогічного аналізу:</b>\n\n"
-            f"{evaluation}\n\n"
+            f"{evaluation_text}\n\n"
             f"───────────────────\n"
             f"🌸 <i>Ти молодець! Щоб потренувати наступну тему, просто надішли новий текст або натисни /start.</i>"
         )
@@ -394,7 +395,7 @@ async def main() -> None:
     load_dotenv()
     bot_token = getenv("BOT_TOKEN")
     gemini_api_key = getenv("GEMINI_API_KEY")
-    gemini_model = getenv("GEMINI_MODEL", "gemini-2.0-flash")
+    gemini_model = getenv("GEMINI_MODEL", "gemini-3.8-flash")
 
     if not bot_token:
         logger.critical("BOT_TOKEN не знайдено! Перевірте наявність BOT_TOKEN у файлі .env.")
@@ -406,21 +407,29 @@ async def main() -> None:
             "Переконайтеся, що ви додали дійсний ключ GEMINI_API_KEY у файл .env для роботи Gemini AI."
         )
 
+    # Configure Google Generative AI
+    genai.configure(api_key=gemini_api_key or "missing-key")
+    model = genai.GenerativeModel(
+        model_name=gemini_model,
+        system_instruction=SYSTEM_INSTRUCTION,
+        generation_config=genai.GenerationConfig(
+            temperature=0.3,
+        ),
+    )
+
     bot = Bot(token=bot_token)
     dp = Dispatcher(storage=MemoryStorage())
-    gemini_client = genai.Client(api_key=gemini_api_key or "missing-key")
 
     dp.include_router(router)
 
     # Dependency injection for handlers
-    dp["gemini_client"] = gemini_client
-    dp["gemini_model"] = gemini_model
+    dp["gemini_model_instance"] = model
 
     logger.info(
         "Бот для підготовки до іспитів на базі Google Gemini (%s) успішно запущений!",
         gemini_model,
     )
-    await dp.start_polling(bot, gemini_client=gemini_client, gemini_model=gemini_model)
+    await dp.start_polling(bot, gemini_model_instance=model)
 
 
 if __name__ == "__main__":
